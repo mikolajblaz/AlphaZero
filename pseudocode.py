@@ -50,36 +50,36 @@ class AlphaZeroConfig(object):
 
 class Node(object):
 
-  def __init__(self, prior: float):
-    self.visit_count = 0
-    self.to_play = -1
-    self.prior = prior
-    self.value_sum = 0
+  def __init__(self, depth: int, total_prob: float, game: Game, action_from_parent: int):
+    self.depth = depth
+    self.total_prob = total_prob
+    self.game = game
+    self.action_from_parent = action_from_parent
     self.children = {}
+    self.visit_count = 0
 
   def expanded(self):
     return len(self.children) > 0
 
-  def value(self):
-    if self.visit_count == 0:
-      return 0
-    return self.value_sum / self.visit_count
-
 
 class Game(object):
+  TERMINAL_REWARD = 10
+  STEP_REWARD = -0.1
 
   def __init__(self, history=None):
     self.history = history or []
     self.child_visits = []
-    self.num_actions = 4672  # action space size for chess; 11259 for shogi, 362 for Go
+    self.num_actions = 4
 
   def terminal(self):
     # Game specific termination rules.
     pass
 
-  def terminal_value(self, to_play):
-    # Game specific value.
-    pass
+  def discounted_terminal_value(self, state_index):
+    # TODO: currently value function is not used in playing anyway
+    final_reward = TERMINAL_REWARD if self.terminal() else 0
+    steps_to_end = len(self.history) - state_index
+    return final_reward + steps_to_end * STEP_REWARD
 
   def legal_actions(self):
     # Game specific calculation of legal actions.
@@ -98,16 +98,20 @@ class Game(object):
         for a in range(self.num_actions)
     ])
 
+  def store_terminated_game_statistics(self, node, action):
+    # We are sure which path is the best
+    self.child_visits.append([
+        1 if a == action else 0
+        for a in range(self.num_actions)
+    ])
+
   def make_image(self, state_index: int):
     # Game specific feature planes.
     return []
 
   def make_target(self, state_index: int):
-    return (self.terminal_value(state_index % 2),
+    return (self.discounted_terminal_value(state_index),
             self.child_visits[state_index])
-
-  def to_play(self):
-    return len(self.history) % 2
 
 
 class ReplayBuffer(object):
@@ -195,39 +199,42 @@ def run_selfplay(config: AlphaZeroConfig, storage: SharedStorage,
 
 
 # Each game is produced by starting at the initial board position, then
-# repeatedly executing a Monte Carlo Tree Search to generate moves until the end
-# of the game is reached.
+# repeatedly executing LevinTS until it finds a solution.
 def play_game(config: AlphaZeroConfig, network: Network):
   game = Game()
   while not game.terminal() and len(game.history) < config.max_moves:
-    action, root = run_mcts(config, game, network)
-    game.apply(action)
-    game.store_search_statistics(root)
+    game = run_levin(config, game, network)
   return game
 
 
-# Core Monte Carlo Tree Search algorithm.
-# To decide on an action, we run N simulations, always starting at the root of
-# the search tree and traversing the tree according to the UCB formula until we
-# reach a leaf node.
-def run_mcts(config: AlphaZeroConfig, game: Game, network: Network):
-  root = Node(0)
-  evaluate(root, game, network)
-  add_exploration_noise(config, root)
-
+# Levin TS is used to find a path leading to terminal state.
+# If terminal node is found, it ends this game.
+# If no path is found in given budget, next action is chosen
+# according to visits count.
+def run_levin(config: AlphaZeroConfig, game: Game, network: Network) -> Game:
+  root = Node(0, 1, game, None)
+  visited = set()
+  fringe = set([root])
   for _ in range(config.num_simulations):
-    node = root
-    scratch_game = game.clone()
-    search_path = [node]
+      node = select_node_to_evaluate(fringe)
+      fringe.remove(node)
+      if node.game.terminal():
+          for n in <path_from_root_to_terminal_node>:
+              node.game.store_terminated_game_statistics(n, n.action_from_parent)
+          return node.game
 
-    while node.expanded():
-      action, node = select_child(config, node)
-      scratch_game.apply(action)
-      search_path.append(node)
+      visited.add(node)
+      children = evaluate(node, network)
+      backpropagate(node, root)
+      fringe.update(children)
 
-    value = evaluate(node, scratch_game, network)
-    backpropagate(search_path, value, scratch_game.to_play())
-  return select_action(config, game, root), root
+  # Path to terminal state was not found.
+  # Fallback: choose next action based on visit count
+  # TODO: consider using value function in this situation. Currently value function is not used anywhere.
+  next_action = select_action(config, game, root)
+  game.apply(next_action)
+  game.store_search_statistics(root)
+  return game
 
 
 def select_action(config: AlphaZeroConfig, game: Game, root: Node):
@@ -240,45 +247,38 @@ def select_action(config: AlphaZeroConfig, game: Game, root: Node):
   return action
 
 
-# Select the child with the highest UCB score.
-def select_child(config: AlphaZeroConfig, node: Node):
-  _, action, child = max((ucb_score(config, node, child), action, child)
-                         for action, child in node.children.iteritems())
-  return action, child
-
-
-# The score for a node is based on its value, plus an exploration bonus based on
-# the prior.
-def ucb_score(config: AlphaZeroConfig, parent: Node, child: Node):
-  pb_c = math.log((parent.visit_count + config.pb_c_base + 1) /
-                  config.pb_c_base) + config.pb_c_init
-  pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
-
-  prior_score = pb_c * child.prior
-  value_score = child.value()
-  return prior_score + value_score
+def select_node_to_evaluate(fringe: Set[Node]):
+    min(fringe, key=lambda n: n.depth / n.total_prob)
+  _, node = max((node.depth / node.total_prob, node)
+                         for node in fringe)
+  return node
 
 
 # We use the neural network to obtain a value and policy prediction.
-def evaluate(node: Node, game: Game, network: Network):
+def evaluate(node: Node, network: Network):
+  game = node.game
   value, policy_logits = network.inference(game.make_image(-1))
+  node.value = value
 
   # Expand the node.
-  node.to_play = game.to_play()
   policy = {a: math.exp(policy_logits[a]) for a in game.legal_actions()}
   policy_sum = sum(policy.itervalues())
   for action, p in policy.iteritems():
-    node.children[action] = Node(p / policy_sum)
-  return value
+    child_game = game.clone()
+    child_game.apply(action)
+
+    conditional_prob = p / policy_sum
+    total_prob = node.total_prob * conditional_prob
+    node.children[action] = Node(node.depth + 1, total_prob, child_game, action)
+  return node.children
 
 
 # At the end of a simulation, we propagate the evaluation all the way up the
 # tree to the root.
-def backpropagate(search_path: List[Node], value: float, to_play):
-  for node in search_path:
-    node.value_sum += value if node.to_play == to_play else (1 - value)
-    node.visit_count += 1
-
+def backpropagate(node: Node, root: Node):
+  while node != root:
+      node = node.parent
+      node.visit_count += 1
 
 # At the start of each search, we add dirichlet noise to the prior of the root
 # to encourage the search to explore new actions.
