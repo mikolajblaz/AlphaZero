@@ -229,12 +229,35 @@ def run_levin(config: AlphaZeroConfig, game: Game, network: Network) -> Game:
       fringe.update(children)
 
   # Path to terminal state was not found.
-  # Fallback: choose next action based on visit count
-  # TODO: consider using value function in this situation. Currently value function is not used anywhere.
-  next_action = select_action(config, game, root)
-  game.apply(next_action)
-  game.store_search_statistics(root)
-  return game
+  # Use some fallback
+  return fallback_1(game, root, visited, fringe, config)
+
+def fallback_1(game, root, visited, fringe, config):
+    # Use visit count.
+    next_action = select_action(config, game, root)
+    game.apply(next_action)
+    game.store_search_statistics(root)
+    return game
+
+def fallback_2(game, root, visited, fringe, config):
+    # Like `fallback_1`, but make a few steps ahead instead of just one
+    pass
+
+def fallback_3(game, root, visited, fringe, config):
+    # Like `fallback_1`, but do not throw away calculated
+    # `visited`, and `fringe` set (and all statistics) - remove
+    # from fringe set nodes that are descendants of root's children
+    # that are not selected as next action
+    pass
+
+def fallback_4(game, root, visited, fringe, config):
+    # Use value function somehow. Currently value function is not used anywhere.
+    # Simple example:
+    _, node = max((node.value, node) for node in fringe)
+    ret_game = node.game
+    for n in <path_from_root_to_node>:
+        ret_game.store_search_statistics(n)
+    return ret_game
 
 
 def select_action(config: AlphaZeroConfig, game: Game, root: Node):
@@ -248,9 +271,7 @@ def select_action(config: AlphaZeroConfig, game: Game, root: Node):
 
 
 def select_node_to_evaluate(fringe: Set[Node]):
-    min(fringe, key=lambda n: n.depth / n.total_prob)
-  _, node = max((node.depth / node.total_prob, node)
-                         for node in fringe)
+  _, node = max((node.depth / node.total_prob, node) for node in fringe)
   return node
 
 
